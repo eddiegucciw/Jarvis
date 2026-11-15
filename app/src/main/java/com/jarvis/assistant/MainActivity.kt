@@ -3,12 +3,15 @@ package com.jarvis.assistant
 import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -24,9 +27,6 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
-import org.json.JSONObject
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
@@ -34,14 +34,15 @@ class MainActivity : Activity() {
     companion object {
         private const val CYAN = "#22D3EE"
         private const val BG = "#0A0F1A"
-        private const val DEFAULT_MODEL = "gemini-2.5-flash"
         private const val REQ_MIC = 1
+        private const val REQ_HANDS_FREE = 2
     }
 
     private lateinit var status: TextView
     private lateinit var transcript: TextView
     private lateinit var scroll: ScrollView
     private lateinit var micButton: Button
+    private lateinit var handsFreeToggle: TextView
 
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
@@ -108,6 +109,15 @@ class MainActivity : Activity() {
         header.addView(settings)
         root.addView(header)
 
+        handsFreeToggle = TextView(this).apply {
+            textSize = 14f
+            typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setOnClickListener { toggleHandsFree() }
+        }
+        val toggleParams = LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT).apply { topMargin = dp(8) }
+        root.addView(handsFreeToggle, toggleParams)
+
         status = TextView(this).apply {
             text = "Idle"
             setTextColor(Color.parseColor("#64748B"))
@@ -171,8 +181,7 @@ class MainActivity : Activity() {
 
     private fun loadBrain() {
         val key = prefs.getString("api_key", "") ?: ""
-        val model = prefs.getString("model", DEFAULT_MODEL)?.ifBlank { DEFAULT_MODEL } ?: DEFAULT_MODEL
-        brain = if (key.isBlank()) null else Brain(key, model)
+        brain = if (key.isBlank()) null else Brain(key, Jarvis.model(prefs))
     }
 
     private fun showSettings() {
@@ -186,8 +195,8 @@ class MainActivity : Activity() {
             setText(prefs.getString("api_key", ""))
         }
         val modelInput = EditText(this).apply {
-            hint = "Model (default $DEFAULT_MODEL)"
-            setText(prefs.getString("model", DEFAULT_MODEL))
+            hint = "Model (default ${Jarvis.DEFAULT_MODEL})"
+            setText(Jarvis.model(prefs))
         }
         box.addView(keyInput)
         box.addView(modelInput)
@@ -309,6 +318,9 @@ class MainActivity : Activity() {
     private fun onMicTapped() {
         when {
             brain == null -> showSettings()
+            JarvisService.running -> {
+                startService(Intent(this, JarvisService::class.java).setAction(JarvisService.ACTION_TALK))
+            }
             listening -> {
                 recognizer?.stopListening()
                 stopConversation(null)
@@ -328,6 +340,14 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_HANDS_FREE) {
+            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                startHandsFree()
+            } else {
+                log("Jarvis", "Hands-free mode needs microphone permission.")
+            }
+            return
+        }
         if (requestCode == REQ_MIC) {
             if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
                 conversationOn = true
@@ -361,35 +381,9 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------------ brain + hands
 
-    private fun systemPrompt(): String {
-        val now = SimpleDateFormat("EEEE d MMMM yyyy, HH:mm", Locale.getDefault()).format(Date())
-        return """
-            You are Jarvis, a witty, loyal, slightly formal personal assistant living on the user's Android phone.
-            The current date and time is $now.
-            Your replies are spoken aloud, so keep them short (1-3 sentences) and natural.
-            Never use markdown, bullet points, asterisks or emoji.
-
-            You can control the phone. When the user asks for one of these actions, reply with ONLY
-            a single-line JSON object and nothing else:
-              {"action":"torch_on"}
-              {"action":"torch_off"}
-              {"action":"battery"}
-              {"action":"clipboard"}
-              {"action":"vibrate"}
-              {"action":"open_app","name":"WhatsApp"}
-              {"action":"set_alarm","hour":6,"minute":30,"label":"Wake up"}      (24-hour clock)
-              {"action":"set_timer","seconds":300,"label":"Tea"}
-              {"action":"web_search","query":"..."}
-              {"action":"dial","number":"0712345678"}
-              {"action":"sms","number":"0712345678","message":"..."}
-            For everything else, just answer normally.
-        """.trimIndent()
-    }
-
     private fun handle(heard: String) {
         log("You", heard)
-        val lower = heard.lowercase(Locale.ROOT).trim().trimEnd('.', '!')
-        if (lower in setOf("goodbye", "bye", "goodbye jarvis", "bye jarvis", "stop", "that's all")) {
+        if (Jarvis.isGoodbye(heard)) {
             conversationOn = false
             say("Goodbye. I'll be here when you need me.", keepListening = false)
             return
@@ -397,12 +391,12 @@ class MainActivity : Activity() {
         val b = brain ?: return showSettings()
         thinking = true
         setStatus("Thinking…")
-        val prompt = systemPrompt()
+        val prompt = Jarvis.systemPrompt()
         Thread {
             val reply = b.ask(heard, prompt)
             runOnUiThread {
                 thinking = false
-                val action = parseAction(reply)
+                val action = Jarvis.parseAction(reply)
                 if (action != null) {
                     val result = actions.run(action)
                     val stay = action.optString("action") !in actions.leavesApp
@@ -415,21 +409,78 @@ class MainActivity : Activity() {
         }.start()
     }
 
-    /** Returns the action JSON if the brain replied with one, otherwise null. */
-    private fun parseAction(reply: String): JSONObject? {
-        val t = reply.trim()
-        if (!t.startsWith("{") && !t.startsWith("```")) return null
-        val start = t.indexOf('{')
-        val end = t.lastIndexOf('}')
-        if (start < 0 || end <= start) return null
-        return try {
-            JSONObject(t.substring(start, end + 1)).takeIf { it.has("action") }
-        } catch (e: Exception) {
-            null
+    // ------------------------------------------------------------------ hands-free
+
+    private fun updateHandsFreeLabel() {
+        val on = JarvisService.running
+        handsFreeToggle.text = if (on) "● HANDS-FREE: ON  (say \"Jarvis\")" else "○ HANDS-FREE: OFF"
+        handsFreeToggle.setTextColor(Color.parseColor(if (on) CYAN else "#64748B"))
+        handsFreeToggle.background = GradientDrawable().apply {
+            cornerRadius = dp(20).toFloat()
+            setStroke(dp(1), Color.parseColor(if (on) CYAN else "#334155"))
+        }
+    }
+
+    private fun toggleHandsFree() {
+        if (JarvisService.running) {
+            startService(Intent(this, JarvisService::class.java).setAction(JarvisService.ACTION_STOP))
+            log("Jarvis", "Hands-free mode off.")
+            return
+        }
+        if (brain == null) return showSettings()
+        val needed = mutableListOf<String>()
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            needed += Manifest.permission.RECORD_AUDIO
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            needed += Manifest.permission.POST_NOTIFICATIONS
+        }
+        if (needed.isEmpty()) startHandsFree() else requestPermissions(needed.toTypedArray(), REQ_HANDS_FREE)
+    }
+
+    private fun startHandsFree() {
+        if (listening) recognizer?.cancel()
+        stopConversation(null)
+        tts?.stop()
+        startForegroundService(Intent(this, JarvisService::class.java).setAction(JarvisService.ACTION_START))
+        log("Jarvis", "Hands-free mode on. Say \"Jarvis\" any time, even with the app closed.")
+        micButton.postDelayed({ updateHandsFreeLabel() }, 600)
+    }
+
+    private val serviceReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            when (intent?.action) {
+                JarvisService.ACTION_LOG -> log(
+                    intent.getStringExtra("who") ?: "Jarvis",
+                    intent.getStringExtra("text") ?: ""
+                )
+                JarvisService.ACTION_STATE -> updateHandsFreeLabel()
+            }
         }
     }
 
     // ------------------------------------------------------------------ lifecycle
+
+    override fun onStart() {
+        super.onStart()
+        val filter = IntentFilter().apply {
+            addAction(JarvisService.ACTION_LOG)
+            addAction(JarvisService.ACTION_STATE)
+        }
+        if (Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(serviceReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(serviceReceiver, filter)
+        }
+        updateHandsFreeLabel()
+    }
+
+    override fun onStop() {
+        unregisterReceiver(serviceReceiver)
+        super.onStop()
+    }
 
     override fun onPause() {
         super.onPause()
